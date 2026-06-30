@@ -26,6 +26,18 @@ LIVE_MARKET_BUCKET_MINUTES = 15
 LIVE_MARKET_MAX_SWING_PCT = 2.8
 UPLOADS_DIR = os.path.join(DATA_DIR, "uploads")
 STUDENT_PHOTO_MAX_BYTES = 4 * 1024 * 1024
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+MARKET_STOCKS = [
+    ("PIA", "Politics in Action", "MARKET INDEX", "Major laws, taxes, economic decisions, and overall simulation activity"),
+    ("BULD", "Big Buildings Now", "REAL ESTATE", "Housing, buildings, property taxes, and zoning laws"),
+    ("TTM", "To the Moon", "INDUSTRIALS", "Rockets, jets, space, defense, and transportation"),
+    ("REAL", "Real Human AI", "TECHNOLOGY", "AI, technology, cybersecurity, privacy laws, and innovation"),
+    ("BOAT", "NoahBoats", "CONSUMER DISCRETIONARY", "Boats, yachts, cruises, luxury spending, and fuel costs"),
+    ("TAM", "Targmart", "CONSUMER STAPLES", "Groceries, household items, food, and packaging"),
+    ("JOHN", "Johnnify", "COMMUNICATION SERVICES", "Entertainment, music, media, advertising, and online communication"),
+    ("MC", "MineCraft", "MATERIALS", "Mining, metals, construction resources, tariffs, and environmental restrictions"),
+]
+MARKET_SYMBOLS = [symbol for symbol, _name, _sector, _description in MARKET_STOCKS]
 
 
 def get_db():
@@ -151,6 +163,29 @@ def init_db():
             FOREIGN KEY (asset_symbol) REFERENCES market_assets(symbol)
         );
 
+        CREATE TABLE IF NOT EXISTS market_ai_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            news_text TEXT NOT NULL,
+            hype_notes TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            submitted_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            applied_at TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS market_ai_suggestions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            review_id INTEGER NOT NULL,
+            asset_symbol TEXT NOT NULL,
+            delta_pct REAL NOT NULL DEFAULT 0,
+            confidence INTEGER NOT NULL DEFAULT 50,
+            reason TEXT NOT NULL,
+            approved_delta_pct REAL NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (review_id) REFERENCES market_ai_reviews(id),
+            FOREIGN KEY (asset_symbol) REFERENCES market_assets(symbol)
+        );
+
         CREATE TABLE IF NOT EXISTS student_users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             camper_id INTEGER NOT NULL UNIQUE,
@@ -233,12 +268,7 @@ def init_db():
     if "banner_theme" not in student_columns:
         conn.execute("ALTER TABLE student_users ADD COLUMN banner_theme TEXT NOT NULL DEFAULT 'violet'")
 
-    for symbol, name, sector in [
-        ("PIA", "Camp Spirit Index", "SPIRIT"),
-        ("OIL", "Fuel & Logistics", "ENERGY"),
-        ("GOLD", "Awards & Prestige", "VALUE"),
-        ("TECH", "Innovation Lab", "TECH"),
-    ]:
+    for symbol, name, sector, _description in MARKET_STOCKS:
         existing_asset = conn.execute(
             "SELECT symbol FROM market_assets WHERE symbol = ?",
             (symbol,),
@@ -257,6 +287,15 @@ def init_db():
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (symbol, DEFAULT_MARKET_PRICE, "Opening market price", "seed", now()),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE market_assets
+                SET name = ?, sector = ?
+                WHERE symbol = ?
+                """,
+                (name, sector, symbol),
             )
 
     admin_user = conn.execute(
@@ -449,6 +488,8 @@ def page_template(content, user=None, message="", error="", action=""):
         "market_buy": "Stock Purchased",
         "market_sell": "Stock Sold",
         "market_event": "Hype Saved",
+        "market_ai": "AI Review Ready",
+        "market_ai_apply": "AI Market Applied",
         "student_created": "Student Portal Ready",
         "promo_granted": "Promo Added",
         "promo_redeemed": "Promo Redeemed",
@@ -825,6 +866,8 @@ def page_template(content, user=None, message="", error="", action=""):
     .action-market_buy {{ background: linear-gradient(135deg, #1d4ed8, #0f172a); }}
     .action-market_sell {{ background: linear-gradient(135deg, #7c2d12, #431407); }}
     .action-market_event {{ background: linear-gradient(135deg, #ca8a04, #713f12); }}
+    .action-market_ai {{ background: linear-gradient(135deg, #155e75, #0f172a); }}
+    .action-market_ai_apply {{ background: linear-gradient(135deg, #047857, #064e3b); }}
     .action-voting_start {{ background: linear-gradient(135deg, #0f766e, #0f172a); }}
     .action-voting_vote {{ background: linear-gradient(135deg, #2563eb, #1e3a8a); }}
     .action-voting_end {{ background: linear-gradient(135deg, #7c2d12, #431407); }}
@@ -1553,11 +1596,13 @@ def render_home(user, message="", error="", action="", tab=""):
     voting_data = voting_payload(conn, active_vote_session)
     recent_vote_sessions = get_recent_voting_sessions(conn, limit=8)
     market_assets = conn.execute(
-        """
+        f"""
         SELECT symbol, name, sector, current_price, previous_price, updated_at, last_reason
         FROM market_assets
+        WHERE symbol IN ({",".join("?" for _ in MARKET_SYMBOLS)})
         ORDER BY symbol
-        """
+        """,
+        MARKET_SYMBOLS,
     ).fetchall()
     latest_event = conn.execute(
         "SELECT * FROM market_events ORDER BY id DESC LIMIT 1"
@@ -1571,15 +1616,39 @@ def render_home(user, message="", error="", action="", tab=""):
         """
     ).fetchall()
     top_positions = conn.execute(
-        """
+        f"""
         SELECT campers.name, market_positions.asset_symbol, market_positions.shares
         FROM market_positions
         JOIN campers ON campers.id = market_positions.camper_id
-        WHERE campers.active = 1 AND market_positions.shares > 0
+        WHERE campers.active = 1
+          AND market_positions.shares > 0
+          AND market_positions.asset_symbol IN ({",".join("?" for _ in MARKET_SYMBOLS)})
         ORDER BY market_positions.shares DESC, campers.name COLLATE NOCASE
         LIMIT 10
-        """
+        """,
+        MARKET_SYMBOLS,
     ).fetchall()
+    latest_ai_review = conn.execute(
+        """
+        SELECT *
+        FROM market_ai_reviews
+        WHERE status = 'PENDING'
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    latest_ai_suggestions = []
+    if latest_ai_review:
+        latest_ai_suggestions = conn.execute(
+            """
+            SELECT market_ai_suggestions.*, market_assets.name
+            FROM market_ai_suggestions
+            JOIN market_assets ON market_assets.symbol = market_ai_suggestions.asset_symbol
+            WHERE market_ai_suggestions.review_id = ?
+            ORDER BY market_ai_suggestions.asset_symbol
+            """,
+            (latest_ai_review["id"],),
+        ).fetchall()
     live_assets = []
     history_by_symbol = {}
     for row in market_assets:
@@ -1594,6 +1663,10 @@ def render_home(user, message="", error="", action="", tab=""):
         f'<option value="{row["id"]}">{html.escape(row["name"])} | Card {html.escape(row["card_number"])}</option>'
         for row in campers
     ) or '<option value="">Add a camper in Bank first</option>'
+    market_options = "".join(
+        f'<option value="{html.escape(symbol)}">{html.escape(symbol)} - {html.escape(name)}</option>'
+        for symbol, name, _sector, _description in MARKET_STOCKS
+    )
 
     camper_rows = "".join(
         f"""
@@ -1710,6 +1783,56 @@ def render_home(user, message="", error="", action="", tab=""):
         """
         for row in top_positions
     ) or '<tr><td colspan="3">No student holdings yet.</td></tr>'
+    ai_suggestion_rows = "".join(
+        f"""
+        <tr>
+          <td>{html.escape(row["asset_symbol"])}</td>
+          <td>{html.escape(row["name"])}</td>
+          <td>{row["delta_pct"]:+.2f}%</td>
+          <td>
+            <input form="apply_ai_review" name="delta_{html.escape(row["asset_symbol"])}" type="number" step="0.01" min="-35" max="35" value="{row["approved_delta_pct"]:.2f}">
+          </td>
+          <td>{row["confidence"]}%</td>
+          <td>{html.escape(row["reason"])}</td>
+        </tr>
+        """
+        for row in latest_ai_suggestions
+    ) or '<tr><td colspan="6">No AI market review is waiting.</td></tr>'
+    ai_review_panel = (
+        f"""
+        <section class="card" style="margin-top: 22px;">
+          <h2>Leader Review: AI Market Suggestions</h2>
+          <p class="mini"><strong>News:</strong> {html.escape(latest_ai_review["news_text"][:320])}</p>
+          <p class="mini"><strong>Hype:</strong> {html.escape(latest_ai_review["hype_notes"] or "No hype note added.")}</p>
+          <form id="apply_ai_review" method="post" action="/market/ai/apply">
+            <input type="hidden" name="review_id" value="{latest_ai_review["id"]}">
+          </form>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Stock</th>
+                  <th>AI Move</th>
+                  <th>Leader Move</th>
+                  <th>Confidence</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody>{ai_suggestion_rows}</tbody>
+            </table>
+          </div>
+          <button form="apply_ai_review" type="submit" style="margin-top:14px;">Apply Reviewed Market Changes</button>
+        </section>
+        """
+        if latest_ai_review
+        else """
+        <section class="card" style="margin-top: 22px;">
+          <h2>Leader Review: AI Market Suggestions</h2>
+          <p class="mini">No AI market review is waiting. Paste a newspaper update above to create one.</p>
+        </section>
+        """
+    )
 
     admin_markup = ""
     if user["role"] == "ADMIN":
@@ -1939,10 +2062,7 @@ def render_home(user, message="", error="", action="", tab=""):
           <input id="buy_card_number" name="card_number" required>
           <label for="buy_symbol">Market</label>
           <select id="buy_symbol" name="symbol" required>
-            <option value="PIA">PIA</option>
-            <option value="OIL">OIL</option>
-            <option value="GOLD">GOLD</option>
-            <option value="TECH">TECH</option>
+            {market_options}
           </select>
           <label for="buy_shares">Shares</label>
           <input id="buy_shares" name="shares" type="number" min="0.01" step="0.01" required>
@@ -1958,10 +2078,7 @@ def render_home(user, message="", error="", action="", tab=""):
           <input id="sell_card_number" name="card_number" required>
           <label for="sell_symbol">Market</label>
           <select id="sell_symbol" name="symbol" required>
-            <option value="PIA">PIA</option>
-            <option value="OIL">OIL</option>
-            <option value="GOLD">GOLD</option>
-            <option value="TECH">TECH</option>
+            {market_options}
           </select>
           <label for="sell_shares">Shares</label>
           <input id="sell_shares" name="shares" type="number" min="0.01" step="0.01" required>
@@ -1974,6 +2091,18 @@ def render_home(user, message="", error="", action="", tab=""):
     {admin_markup}
 
     <section class="admin-grid">
+      <div class="card">
+        <h2>AI News Market Update</h2>
+        <form method="post" action="/market/ai/analyze">
+          <label for="market_news_text">Newspaper Or News Update</label>
+          <textarea id="market_news_text" name="news_text" rows="7" placeholder="Paste the PoliticsInAction newspaper update, bill summary, debate result, economic shock, or leader news here..." required></textarea>
+          <label for="market_hype_notes">Leader Hype Notes</label>
+          <textarea id="market_hype_notes" name="hype_notes" rows="3" placeholder="Example: TTM hype is high, students are nervous about mining, tech is popular today..."></textarea>
+          <button type="submit">Ask AI For Stock Moves</button>
+        </form>
+        <p class="tiny">AI creates suggested moves only. Leaders review and adjust before prices change.</p>
+      </div>
+
       <div class="card">
         <h2>Camp Market Pulse</h2>
         <p><strong>Latest hype note:</strong> {html.escape(latest_event["summary"] if latest_event else "No hype update has been submitted yet.")}</p>
@@ -2011,6 +2140,8 @@ def render_home(user, message="", error="", action="", tab=""):
         </table>
       </div>
     </section>
+
+    {ai_review_panel}
 
     <section class="card" style="margin-top: 22px;">
       <h2>Market Update History</h2>
@@ -3169,6 +3300,117 @@ def build_rule_based_market(event, assets):
     return updates
 
 
+def stock_context_text():
+    return "\n".join(
+        f"- {symbol}: {name} ({sector}) - {description}"
+        for symbol, name, sector, description in MARKET_STOCKS
+    )
+
+
+def parse_ai_market_json(raw_text):
+    raw_text = (raw_text or "").strip()
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`")
+        if raw_text.lower().startswith("json"):
+            raw_text = raw_text[4:].strip()
+    return json.loads(raw_text)
+
+
+def call_openai_market_analysis(news_text, hype_notes):
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set on the server.")
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError("The OpenAI Python package is not installed on the server.") from exc
+
+    client = OpenAI(api_key=api_key)
+    system_prompt = f"""
+You are the PoliticsInAction stock market analyst.
+Read the leader's news update and hype notes, then suggest fair stock price moves for every eligible stock.
+
+Eligible stocks:
+{stock_context_text()}
+
+Rules:
+- Return one suggestion for every eligible stock symbol.
+- delta_pct must be between -20 and 20.
+- confidence must be a whole number from 0 to 100.
+- Keep reasons short, student-friendly, and tied to the news.
+- Do not invent stocks outside the eligible list.
+- Leaders will review these suggestions before applying them.
+"""
+    user_prompt = f"""
+News update:
+{news_text}
+
+Leader hype notes:
+{hype_notes or "No extra hype notes provided."}
+"""
+    schema = {
+        "name": "market_analysis",
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "summary": {"type": "string"},
+                "suggestions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "symbol": {"type": "string", "enum": MARKET_SYMBOLS},
+                            "delta_pct": {"type": "number", "minimum": -20, "maximum": 20},
+                            "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["symbol", "delta_pct", "confidence", "reason"],
+                    },
+                },
+            },
+            "required": ["summary", "suggestions"],
+        },
+    }
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        response_format={"type": "json_schema", "json_schema": schema},
+    )
+    content = response.choices[0].message.content
+    return parse_ai_market_json(content)
+
+
+def normalize_ai_suggestions(ai_result):
+    by_symbol = {}
+    for item in ai_result.get("suggestions", []):
+        symbol = str(item.get("symbol", "")).upper()
+        if symbol not in MARKET_SYMBOLS:
+            continue
+        delta_pct = max(-20.0, min(20.0, float(item.get("delta_pct", 0))))
+        confidence = max(0, min(100, int(item.get("confidence", 50))))
+        reason = str(item.get("reason", "")).strip()[:240] or "No reason provided."
+        by_symbol[symbol] = {
+            "symbol": symbol,
+            "delta_pct": delta_pct,
+            "confidence": confidence,
+            "reason": reason,
+        }
+    for symbol, name, _sector, _description in MARKET_STOCKS:
+        if symbol not in by_symbol:
+            by_symbol[symbol] = {
+                "symbol": symbol,
+                "delta_pct": 0.0,
+                "confidence": 30,
+                "reason": f"No clear direct effect on {name}.",
+            }
+    return [by_symbol[symbol] for symbol in MARKET_SYMBOLS]
+
+
 def apply_market_updates(conn, updates):
     timestamp = now()
     for update in updates:
@@ -3188,6 +3430,98 @@ def apply_market_updates(conn, updates):
             """,
             (update["symbol"], update["price"], update["reason"], update["source"], timestamp),
         )
+
+
+def handle_ai_market_analyze(user, data):
+    news_text = data.get("news_text", "").strip()
+    hype_notes = data.get("hype_notes", "").strip()
+    if not news_text:
+        return render_home(user, error="Paste a news update before asking AI for stock moves.", tab="stocks")
+    if len(news_text) < 20:
+        return render_home(user, error="Add a little more news context so the AI has something real to analyze.", tab="stocks")
+    try:
+        ai_result = call_openai_market_analysis(news_text, hype_notes)
+        suggestions = normalize_ai_suggestions(ai_result)
+    except Exception as exc:
+        return render_home(user, error=f"AI market analysis failed: {exc}", tab="stocks")
+
+    conn = get_db()
+    timestamp = now()
+    conn.execute("UPDATE market_ai_reviews SET status = 'ARCHIVED' WHERE status = 'PENDING'")
+    cursor = conn.execute(
+        """
+        INSERT INTO market_ai_reviews (news_text, hype_notes, status, submitted_by, created_at, applied_at)
+        VALUES (?, ?, 'PENDING', ?, ?, '')
+        """,
+        (news_text, hype_notes, user["username"], timestamp),
+    )
+    review_id = cursor.lastrowid
+    for suggestion in suggestions:
+        conn.execute(
+            """
+            INSERT INTO market_ai_suggestions (review_id, asset_symbol, delta_pct, confidence, reason, approved_delta_pct, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                review_id,
+                suggestion["symbol"],
+                suggestion["delta_pct"],
+                suggestion["confidence"],
+                suggestion["reason"],
+                suggestion["delta_pct"],
+                timestamp,
+            ),
+        )
+    log_action(conn, user, "market_ai_review", f"Created AI review for news: {news_text[:80]}")
+    conn.commit()
+    conn.close()
+    return render_home(user, message="AI market review is ready for leader approval.", action="market_ai", tab="stocks")
+
+
+def handle_ai_market_apply(user, data):
+    review_id_raw = data.get("review_id", "")
+    try:
+        review_id = int(review_id_raw)
+    except ValueError:
+        return render_home(user, error="AI review id was invalid.", tab="stocks")
+    conn = get_db()
+    review = conn.execute(
+        "SELECT * FROM market_ai_reviews WHERE id = ? AND status = 'PENDING'",
+        (review_id,),
+    ).fetchone()
+    if not review:
+        conn.close()
+        return render_home(user, error="No pending AI market review was found.", tab="stocks")
+    suggestions = conn.execute(
+        "SELECT * FROM market_ai_suggestions WHERE review_id = ? ORDER BY asset_symbol",
+        (review_id,),
+    ).fetchall()
+    updates = []
+    for suggestion in suggestions:
+        symbol = suggestion["asset_symbol"]
+        asset = get_market_asset(conn, symbol)
+        if not asset:
+            continue
+        approved_delta = clamp_float(data.get(f"delta_{symbol}"), -35.0, 35.0, suggestion["approved_delta_pct"])
+        new_price = round(max(5.0, asset["current_price"] * (1 + approved_delta / 100.0)), 2)
+        reason = f"AI news review: {approved_delta:+.2f}% for {symbol}. {suggestion['reason']}"
+        updates.append({"symbol": symbol, "price": new_price, "reason": reason, "source": "ai_review"})
+        conn.execute(
+            "UPDATE market_ai_suggestions SET approved_delta_pct = ? WHERE id = ?",
+            (approved_delta, suggestion["id"]),
+        )
+    if not updates:
+        conn.close()
+        return render_home(user, error="No valid AI suggestions were available to apply.", tab="stocks")
+    apply_market_updates(conn, updates)
+    conn.execute(
+        "UPDATE market_ai_reviews SET status = 'APPLIED', applied_at = ? WHERE id = ?",
+        (now(), review_id),
+    )
+    log_action(conn, user, "market_ai_apply", f"Applied AI market review {review_id}")
+    conn.commit()
+    conn.close()
+    return render_home(user, message="Reviewed AI market changes were applied.", action="market_ai_apply", tab="stocks")
 
 
 def handle_market_event(user, data):
@@ -3477,7 +3811,7 @@ def handle_weekly_reset(user, data):
         (DEFAULT_MARKET_PRICE, DEFAULT_MARKET_PRICE, reset_time, "Fresh week reset"),
     )
     conn.execute("DELETE FROM market_snapshots")
-    for symbol in ["PIA", "OIL", "GOLD", "TECH"]:
+    for symbol in MARKET_SYMBOLS:
         conn.execute(
             """
             INSERT INTO market_snapshots (asset_symbol, price, reason, source, created_at)
@@ -4104,6 +4438,16 @@ def application(environ, start_response):
 
     if method == "POST" and path == "/market/refresh":
         body = handle_market_refresh(user).encode("utf-8")
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [body]
+
+    if method == "POST" and path == "/market/ai/analyze":
+        body = handle_ai_market_analyze(user, get_post_data(environ)).encode("utf-8")
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [body]
+
+    if method == "POST" and path == "/market/ai/apply":
+        body = handle_ai_market_apply(user, get_post_data(environ)).encode("utf-8")
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [body]
 

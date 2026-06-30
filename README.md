@@ -87,6 +87,8 @@ For Render:
   - `ADMIN_USERNAME`: your real admin username
   - `ADMIN_PASSWORD`: your real admin password
   - `DATA_DIR`: persistent storage folder, for example `/var/data`
+  - `OPENAI_API_KEY`: OpenAI API key for AI stock-news analysis
+  - `OPENAI_MODEL`: optional model override, defaults to `gpt-4o-mini`
 - Add a persistent disk mounted at the same path as `DATA_DIR` if you want balances, uploaded photos, sessions, and promos to survive restarts.
 
 Important: `camp_cards.db` and `uploads/` are ignored by git on purpose so real camper data and photos do not get pushed publicly. If you want to move the current local data to the server, use a host with persistent storage and upload `camp_cards.db` plus `uploads/` into that storage folder.
@@ -97,6 +99,21 @@ Important: `camp_cards.db` and `uploads/` are ignored by git on purpose so real 
 - `Procfile` gives hosts a default web command.
 - `runtime.txt` pins Python.
 - `/health` returns a small JSON status response for host health checks.
+
+## AI stock market
+
+The Stocks tab has an AI news-analysis form. A leader pastes the PoliticsInAction newspaper/news update and optional hype notes. The AI suggests percent changes for:
+
+- `PIA` Politics in Action
+- `BULD` Big Buildings Now
+- `TTM` To the Moon
+- `REAL` Real Human AI
+- `BOAT` NoahBoats
+- `TAM` Targmart
+- `JOHN` Johnnify
+- `MC` MineCraft
+
+The AI suggestions do not change prices immediately. Leaders review or edit each percent move, then apply the reviewed market changes.
 
 ## Good next upgrades
 
